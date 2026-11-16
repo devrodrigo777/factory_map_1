@@ -1,0 +1,828 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { api } from '../api.js';
+import { useAuth } from '../components/Auth.jsx';
+import Shell from '../components/Shell.jsx';
+import Modal from '../components/Modal.jsx';
+import Icon from '../components/Icons.jsx';
+import { useToast } from '../components/Toast.jsx';
+import { useConfirm } from '../components/ConfirmModal.jsx';
+import { formatBytes, formatDateTime, formatInt } from '../format.js';
+import DynamicSyncCode from '../components/DynamicSyncCode.jsx';
+import SyncCameraScanner from '../components/SyncCameraScanner.jsx';
+
+const TYPE_NAME = { data: 'Somente dados', full: 'Dados + configurações' };
+
+function parseManifestFromCode(code) {
+  if (!code || typeof code !== 'string') return null;
+  const parts = code.trim().split('.');
+  if (parts.length !== 3 || parts[0] !== 'FMSYNC1') return null;
+  try {
+    let b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    while (b64.length % 4) b64 += '=';
+    const jsonStr = decodeURIComponent(escape(atob(b64)));
+    return JSON.parse(jsonStr);
+  } catch {
+    return null;
+  }
+}
+
+export default function Backup() {
+  const toast = useToast();
+  const confirm = useConfirm();
+  const { expire, user } = useAuth();
+  const fileRef = useRef(null);
+
+  const [tab, setTab] = useState('backup'); // 'backup' | 'sync' | 'account'
+  const [list, setList] = useState([]);
+  const [type, setType] = useState('full');
+  const [withUsers, setWithUsers] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [pending, setPending] = useState(null); // { file?, name?, manifest, images }
+  const [mode, setMode] = useState('replace');
+
+  // Estado da Área de Risco (Guia Conta)
+  const [dangerModal, setDangerModal] = useState(null);
+  const [typedKeyword, setTypedKeyword] = useState('');
+  const [dangerBusy, setDangerBusy] = useState(false);
+
+  // Estado da Sincronização
+  const [syncScope, setSyncScope] = useState(() => localStorage.getItem('sync_scope_pref') || 'full');
+  const [syncDirection, setSyncDirection] = useState('send'); // 'send' | 'receive'
+  const [syncExportData, setSyncExportData] = useState(null);
+  const [syncExportModalOpen, setSyncExportModalOpen] = useState(false);
+  const [receiveCode, setReceiveCode] = useState('');
+  const [adminPassword, setAdminPassword] = useState('');
+  const [receiveMode, setReceiveMode] = useState('replace');
+  const [copiedSync, setCopiedSync] = useState(false);
+  const [cameraOpen, setCameraOpen] = useState(false);
+  const [confirmModal, setConfirmModal] = useState(null);
+  const [confirmSuccess, setConfirmSuccess] = useState(null);
+
+  const fail = useCallback((e) => toast(e.message, 'error'), [toast]);
+  const load = useCallback(() => api.listBackups().then(setList).catch(fail), [fail]);
+  useEffect(() => { load(); }, [load]);
+
+  const handleScopeChange = (newScope) => {
+    setSyncScope(newScope);
+    localStorage.setItem('sync_scope_pref', newScope);
+    setSyncExportData(null);
+  };
+
+  const create = async () => {
+    setBusy(true);
+    try {
+      const b = await api.createBackup({ type, include_users: withUsers });
+      await load();
+      toast('Backup criado. Baixando…');
+      window.location.href = `/api/backup/files/${encodeURIComponent(b.name)}`;
+    } catch (e) { fail(e); } finally { setBusy(false); }
+  };
+
+  const inspect = async (src) => {
+    try {
+      const r = await api.inspectBackup(src);
+      setPending({ ...src, ...r });
+      setMode('replace');
+    } catch (e) { fail(e); }
+  };
+
+  const onFile = (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (file) inspect({ file });
+  };
+
+  const restore = async () => {
+    const full = pending.manifest.type === 'full';
+    const msg = full
+      ? 'Restaurar vai SUBSTITUIR as plantas, áreas, campos, KPIs, perfis de importação e todos os registros pelo conteúdo do backup.'
+      : mode === 'replace'
+        ? 'Restaurar vai SUBSTITUIR todos os registros atuais pelos do backup.'
+        : 'Os registros do backup serão ACRESCENTADOS aos atuais (repetidos são ignorados).';
+    const ok = await confirm({
+      title: 'Restaurar backup',
+      message: `${msg}\n\nUm backup de segurança do estado atual é criado antes. Continuar?`,
+      confirmText: 'Restaurar backup',
+      danger: true,
+    });
+    if (!ok) return;
+    setBusy(true);
+    try {
+      const r = await api.restoreBackup({ file: pending.file, name: pending.name, mode });
+      toast('Backup restaurado.');
+      setPending(null);
+      if (r.relogin) { expire(); return; }
+      load();
+    } catch (e) { fail(e); } finally { setBusy(false); }
+  };
+
+  const remove = async (b) => {
+    const ok = await confirm({
+      title: 'Excluir backup',
+      message: `Excluir o arquivo ${b.name} do servidor?`,
+      confirmText: 'Excluir arquivo',
+      danger: true,
+    });
+    if (!ok) return;
+    try { await api.deleteBackup(b.name); load(); } catch (e) { fail(e); }
+  };
+
+  // Funções de Sincronização
+  const handleGenerateSync = async () => {
+    setBusy(true);
+    try {
+      const res = await api.exportSyncPackage(syncScope);
+      setSyncExportData(res);
+      setSyncExportModalOpen(true);
+      toast('Código e dados de sincronização gerados com sucesso!');
+    } catch (e) {
+      fail(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleCopySyncCode = () => {
+    if (!syncExportData?.code) return;
+    navigator.clipboard.writeText(syncExportData.code).then(() => {
+      setCopiedSync(true);
+      setTimeout(() => setCopiedSync(false), 2500);
+      toast('Código de sincronização copiado para a área de transferência.');
+    }).catch(() => {});
+  };
+
+  const handlePasteFromClipboard = async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        setReceiveCode(text.trim());
+        toast('Código colado com sucesso.');
+      }
+    } catch {
+      toast('Não foi possível ler a área de transferência automaticamente. Use Ctrl+V.', 'warn');
+    }
+  };
+
+  const openSyncConfirmModal = (rawCode) => {
+    const code = (rawCode || receiveCode).trim();
+    if (!code) {
+      toast('Nenhum código de sincronização disponível.', 'warn');
+      return;
+    }
+    const manifest = parseManifestFromCode(code);
+    setConfirmModal({
+      code,
+      manifest,
+    });
+    setConfirmSuccess(null);
+    setAdminPassword('');
+  };
+
+  const handleExecuteApply = async () => {
+    if (!confirmModal?.code) return;
+    if (!adminPassword) return toast('Digite sua senha de administrador.', 'error');
+
+    setBusy(true);
+    try {
+      const res = await api.applySyncPackage({
+        code: confirmModal.code,
+        password: adminPassword,
+        mode: receiveMode,
+      });
+      setConfirmSuccess(res.appliedCounts || { records: 0, maps: 0 });
+      toast('Sincronização aplicada com sucesso! Atualizando aplicação…');
+      setTimeout(() => {
+        window.location.href = '/';
+      }, 1600);
+    } catch (e) {
+      fail(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleOpenDanger = (action, title, desc, keyword) => {
+    setTypedKeyword('');
+    setDangerModal({ action, title, desc, keyword });
+  };
+
+  const handleExecuteDanger = async () => {
+    if (!dangerModal || typedKeyword.trim() !== dangerModal.keyword) return;
+    setDangerBusy(true);
+    try {
+      if (dangerModal.action === 'clear-data') {
+        const res = await api.clearData(typedKeyword.trim());
+        toast(res.message || 'Dados excluídos com sucesso.');
+        setDangerModal(null);
+      } else if (dangerModal.action === 'clear-environment') {
+        const res = await api.clearEnvironment(typedKeyword.trim());
+        toast(res.message || 'Dados e configurações excluídos com sucesso.');
+        setDangerModal(null);
+        setTimeout(() => { window.location.href = '/admin'; }, 1000);
+      } else if (dangerModal.action === 'clear-backups') {
+        const res = await api.clearBackups(typedKeyword.trim());
+        toast(res.message || 'Backups excluídos com sucesso.');
+        setDangerModal(null);
+        load();
+      }
+    } catch (e) {
+      fail(e);
+    } finally {
+      setDangerBusy(false);
+    }
+  };
+
+  return (
+    <Shell title="Backup e restauração">
+      <div className="page narrow">
+        <div className="tabs-mini" role="tablist" style={{ marginBottom: 16 }}>
+          <button
+            role="tab"
+            aria-selected={tab === 'backup'}
+            className={tab === 'backup' ? 'on' : ''}
+            onClick={() => setTab('backup')}
+          >
+            <Icon name="save" size={15} /> Backups locais
+          </button>
+          <button
+            role="tab"
+            aria-selected={tab === 'sync'}
+            className={tab === 'sync' ? 'on' : ''}
+            onClick={() => setTab('sync')}
+          >
+            <Icon name="swap" size={15} /> Sincronização (Online ↔ Offline)
+          </button>
+          <button
+            role="tab"
+            aria-selected={tab === 'account'}
+            className={tab === 'account' ? 'on' : ''}
+            onClick={() => setTab('account')}
+          >
+            <Icon name="user" size={15} /> Conta
+          </button>
+        </div>
+
+        {tab === 'account' ? (
+          /* =========================================================================
+             Aba Conta: Área de Risco (Exclusão de Dados, Configurações e Backups)
+             ========================================================================= */
+          <div className="danger-zone-section">
+            <section className="danger-zone-card">
+              <div className="danger-zone-header">
+                <Icon name="alert" size={24} />
+                <h2>Área de Risco</h2>
+              </div>
+              <p className="danger-zone-desc">
+                As ações abaixo removem permanentemente dados e configurações do sistema. A recuperação só poderá ser realizada caso você possua um arquivo de backup (.zip) salvo previamente. Proceda com cautela.
+              </p>
+
+              <div className="danger-item-row">
+                <div className="danger-item-info">
+                  <strong>Excluir dados</strong>
+                  <p>Remove todos os registros LOTOTO de bloqueio, histórico de alterações e histórico de importações. Suas plantas, áreas, campos e KPIs permanecem intactos.</p>
+                </div>
+                <button
+                  type="button"
+                  className="btn danger"
+                  onClick={() => handleOpenDanger(
+                    'clear-data',
+                    'Excluir Todos os Dados',
+                    'Esta ação apagará permanentemente todos os registros de bloqueio, históricos e importações.',
+                    'EXCLUIR DADOS'
+                  )}
+                >
+                  Excluir dados…
+                </button>
+              </div>
+
+              <div className="danger-item-row">
+                <div className="danger-item-info">
+                  <strong>Excluir dados + configurações</strong>
+                  <p>Remove todos os registros, plantas, imagens enviadas, áreas demarcadas, campos personalizados e KPIs. Os usuários são mantidos para que o acesso não seja perdido.</p>
+                </div>
+                <button
+                  type="button"
+                  className="btn danger"
+                  onClick={() => handleOpenDanger(
+                    'clear-environment',
+                    'Excluir Dados e Configurações',
+                    'Esta ação apagará todas as plantas, áreas, imagens, campos, KPIs e registros do ambiente. Os usuários e senhas serão mantidos.',
+                    'EXCLUIR TUDO'
+                  )}
+                >
+                  Excluir dados + configurações…
+                </button>
+              </div>
+
+              <div className="danger-item-row">
+                <div className="danger-item-info">
+                  <strong>Excluir backups</strong>
+                  <p>Remove permanentemente todos os arquivos de backup (.zip) locais salvos no servidor.</p>
+                </div>
+                <button
+                  type="button"
+                  className="btn danger"
+                  onClick={() => handleOpenDanger(
+                    'clear-backups',
+                    'Excluir Todos os Backups Locais',
+                    'Todos os arquivos .zip de backup salvos no servidor serão apagados permanentemente.',
+                    'EXCLUIR BACKUPS'
+                  )}
+                >
+                  Excluir backups…
+                </button>
+              </div>
+            </section>
+          </div>
+        ) : tab === 'sync' ? (
+          /* =========================================================================
+             Aba de Sincronização Online ↔ Offline
+             ========================================================================= */
+          <div className="sync-section">
+            <section className="card">
+              <h2>Sincronização entre instâncias (Online ↔ Offline)</h2>
+              <p className="muted">
+                Transfira dados entre a versão online e a versão local da fábrica com total integridade via código visual dinâmico ou transferência manual por texto.
+              </p>
+
+              <div className="choice-list" role="radiogroup">
+                <label className={`choice ${syncScope === 'full' ? 'on' : ''}`}>
+                  <input
+                    type="radio"
+                    name="syncScope"
+                    checked={syncScope === 'full'}
+                    onChange={() => handleScopeChange('full')}
+                  />
+                  <span>
+                    <strong>Dados + configurações (Completo - Recomendado)</strong>
+                    <small>Transfere tudo: plantas, imagens, áreas, campos, KPIs, configurações e registros de bloqueio.</small>
+                  </span>
+                </label>
+                <label className={`choice ${syncScope === 'data' ? 'on' : ''}`}>
+                  <input
+                    type="radio"
+                    name="syncScope"
+                    checked={syncScope === 'data'}
+                    onChange={() => handleScopeChange('data')}
+                  />
+                  <span>
+                    <strong>Somente registros de bloqueio</strong>
+                    <small>Transfere apenas os registros de bloqueio. Mantém plantas, áreas e campos existentes como estão.</small>
+                  </span>
+                </label>
+              </div>
+
+              <div className="seg" style={{ marginTop: 16 }}>
+                <button
+                  type="button"
+                  className={`btn ${syncDirection === 'send' ? 'active' : ''}`}
+                  onClick={() => setSyncDirection('send')}
+                >
+                  <Icon name="upload" size={16} /> Gerar sincronização (Enviar)
+                </button>
+                <button
+                  type="button"
+                  className={`btn ${syncDirection === 'receive' ? 'active' : ''}`}
+                  onClick={() => setSyncDirection('receive')}
+                >
+                  <Icon name="swap" size={16} /> Receber sincronização (Aplicar)
+                </button>
+              </div>
+
+              {syncDirection === 'send' ? (
+                <div style={{ marginTop: 18 }}>
+                  <div className="row">
+                    <button className="btn primary" onClick={handleGenerateSync} disabled={busy}>
+                      <Icon name="swap" /> {busy ? 'Iniciando processo…' : 'Iniciar Processo de Sincronização'}
+                    </button>
+                    {syncExportData && (
+                      <button className="btn" onClick={() => setSyncExportModalOpen(true)}>
+                        <Icon name="qr" /> Ver código gerado
+                      </button>
+                    )}
+                  </div>
+
+                  {syncExportData && (
+                    <div style={{ marginTop: 16 }}>
+                      <div className="card-callout" style={{ background: '#f4f8fc', border: '1px solid #bfdbfe', borderRadius: 10, padding: 12 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10 }}>
+                          <div>
+                            <strong style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                              <Icon name="check" size={16} /> Pacote de sincronização disponível
+                            </strong>
+                            <small className="muted" style={{ display: 'block', marginTop: 2 }}>
+                              {TYPE_NAME[syncExportData.manifest.type]} ({formatInt(syncExportData.manifest.counts.records)} registros) — {formatBytes(syncExportData.compressedBytes)}
+                            </small>
+                          </div>
+                          <button type="button" className="btn primary" onClick={() => setSyncExportModalOpen(true)}>
+                            Abrir transmissão / código
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div style={{ marginTop: 18, display: 'flex', flexDirection: 'column', gap: 14 }}>
+                  {/* Leitor Óptico via Câmera integrado */}
+                  <div className="card-callout" style={{ background: '#0e1724', border: '1px solid #1f3044', borderRadius: 12, padding: 14 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10 }}>
+                      <div>
+                        <strong style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.95rem' }}>
+                          <Icon name="camera" size={18} /> Leitor Óptico via Câmera
+                        </strong>
+                        <small className="muted" style={{ display: 'block', marginTop: 2 }}>
+                          Aponte a câmera para o Código Visual Dinâmico na outra tela para capturar automaticamente.
+                        </small>
+                      </div>
+                      <button
+                        type="button"
+                        className="btn primary"
+                        onClick={() => setCameraOpen(true)}
+                      >
+                        <Icon name="camera" size={16} /> Abrir leitor da câmera
+                      </button>
+                    </div>
+                  </div>
+
+                  <SyncCameraScanner
+                    isOpen={cameraOpen}
+                    onClose={() => setCameraOpen(false)}
+                    onScan={(scannedCode) => {
+                      setReceiveCode(scannedCode);
+                      openSyncConfirmModal(scannedCode);
+                    }}
+                  />
+
+                  <label className="field" style={{ marginTop: 4 }}>
+                    <span>Ou cole o código de sincronização manualmente (Ctrl+V):</span>
+                    <textarea
+                      rows={4}
+                      value={receiveCode}
+                      onChange={(e) => setReceiveCode(e.target.value)}
+                      placeholder="Cole aqui o código (FMSYNC1...) caso prefira transferir manualmente"
+                      className="sync-code-area"
+                    />
+                  </label>
+
+                  <div className="row">
+                    <button type="button" className="btn" onClick={handlePasteFromClipboard}>
+                      <Icon name="file" size={16} /> Colar da área de transferência
+                    </button>
+                    <button
+                      type="button"
+                      className="btn primary"
+                      onClick={() => openSyncConfirmModal(receiveCode)}
+                      disabled={!receiveCode.trim()}
+                    >
+                      <Icon name="check" size={16} /> Analisar e aplicar código
+                    </button>
+                    {receiveCode && (
+                      <button type="button" className="btn ghost" onClick={() => setReceiveCode('')}>
+                        Limpar
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+            </section>
+          </div>
+        ) : (
+          /* =========================================================================
+             Aba de Backups em Arquivo (Tradicional)
+             ========================================================================= */
+          <>
+            <section className="card">
+              <h2>Criar backup</h2>
+              <div className="choice-list" role="radiogroup">
+                <label className={`choice ${type === 'data' ? 'on' : ''}`}>
+                  <input type="radio" name="type" checked={type === 'data'} onChange={() => setType('data')} />
+                  <span><strong>Somente dados</strong><small>Registros de bloqueio e histórico de importações. Plantas, áreas, campos e KPIs não entram.</small></span>
+                </label>
+                <label className={`choice ${type === 'full' ? 'on' : ''}`}>
+                  <input type="radio" name="type" checked={type === 'full'} onChange={() => setType('full')} />
+                  <span><strong>Dados + configurações</strong><small>Tudo acima, mais plantas e imagens, áreas e cadeados, campos, KPIs, perfis de importação e ajustes. Serve para recuperar ou clonar o sistema inteiro.</small></span>
+                </label>
+              </div>
+              {type === 'full' && (
+                <label className="check">
+                  <input type="checkbox" checked={withUsers} onChange={(e) => setWithUsers(e.target.checked)} />
+                  Incluir usuários e senhas (guardadas de forma criptografada). Proteja o arquivo.
+                </label>
+              )}
+              <div className="row">
+                <button className="btn primary" onClick={create} disabled={busy}><Icon name="save" /> Criar e baixar backup</button>
+                <a className="btn" href="/api/export/records.xlsx"><Icon name="upload" /> Exportar registros (Excel)</a>
+              </div>
+              <p className="muted">O sistema também cria um backup completo automático por dia no servidor (guarda os últimos 14).</p>
+            </section>
+
+            <section className="card">
+              <h2>Backups guardados no servidor</h2>
+              {list.length === 0 ? <p className="muted">Nenhum backup ainda.</p> : (
+                <div className="table-wrap">
+                  <table className="table">
+                    <thead><tr><th>Arquivo</th><th>Tipo</th><th>Criado em</th><th className="num">Tamanho</th><th /></tr></thead>
+                    <tbody>
+                      {list.map((b) => (
+                        <tr key={b.name}>
+                          <td>{b.name}{b.auto && <span className="badge off you">automático</span>}</td>
+                          <td>{TYPE_NAME[b.type]}</td>
+                          <td>{formatDateTime(b.created_at)}</td>
+                          <td className="num">{formatBytes(b.size)}</td>
+                          <td className="row-actions">
+                            <a className="btn" href={`/api/backup/files/${encodeURIComponent(b.name)}`}>Baixar</a>
+                            <button className="btn" onClick={() => inspect({ name: b.name })}>Restaurar…</button>
+                            <button className="btn icon ghost danger" onClick={() => remove(b)} aria-label="Excluir backup"><Icon name="trash" /></button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </section>
+
+            <section className="card">
+              <h2>Restaurar de um arquivo</h2>
+              <p className="muted">Escolha um backup <code>.zip</code> deste sistema (por exemplo, guardado em outro computador).</p>
+              <input ref={fileRef} type="file" accept=".zip" hidden onChange={onFile} />
+              <div className="row"><button className="btn" onClick={() => fileRef.current.click()}><Icon name="upload" /> Escolher arquivo de backup</button></div>
+            </section>
+
+            {pending && (
+              <section className="card restore-card">
+                <h2>Restaurar: {pending.file?.name || pending.name}</h2>
+                <dl className="facts">
+                  <div><dt>Tipo</dt><dd>{TYPE_NAME[pending.manifest.type]}</dd></div>
+                  <div><dt>Criado em</dt><dd>{formatDateTime(pending.manifest.created_at)}</dd></div>
+                  <div><dt>Registros</dt><dd>{formatInt(pending.manifest.counts.records)}</dd></div>
+                  {pending.manifest.type === 'full' && <>
+                    <div><dt>Plantas / áreas</dt><dd>{pending.manifest.counts.maps} / {pending.manifest.counts.areas}</dd></div>
+                    <div><dt>Campos / KPIs</dt><dd>{pending.manifest.counts.fields} / {pending.manifest.counts.kpis}</dd></div>
+                    <div><dt>Usuários</dt><dd>{pending.manifest.includes_users ? `incluídos (${pending.manifest.counts.users})` : 'não incluídos'}</dd></div>
+                  </>}
+                </dl>
+                {pending.manifest.type === 'data' && (
+                  <div className="choice-list">
+                    <label className={`choice ${mode === 'replace' ? 'on' : ''}`}>
+                      <input type="radio" name="mode" checked={mode === 'replace'} onChange={() => setMode('replace')} />
+                      <span><strong>Substituir</strong><small>Apaga os registros atuais e coloca os do backup.</small></span>
+                    </label>
+                    <label className={`choice ${mode === 'append' ? 'on' : ''}`}>
+                      <input type="radio" name="mode" checked={mode === 'append'} onChange={() => setMode('append')} />
+                      <span><strong>Acrescentar</strong><small>Mantém os atuais e adiciona só o que não existe ainda.</small></span>
+                    </label>
+                  </div>
+                )}
+                {pending.manifest.includes_users && (
+                  <p className="notice">Este backup contém usuários: eles substituirão os atuais e você precisará entrar de novo com uma conta do backup.</p>
+                )}
+                <div className="row">
+                  <button className="btn danger-solid" onClick={restore} disabled={busy}>{busy ? 'Restaurando…' : 'Restaurar agora'}</button>
+                  <button className="btn" onClick={() => setPending(null)}>Cancelar</button>
+                </div>
+              </section>
+            )}
+          </>
+        )}
+
+        {confirmModal && (
+          <div className="sync-confirm-modal-backdrop" onClick={() => !busy && setConfirmModal(null)}>
+            <div className="sync-confirm-modal-card" onClick={(e) => e.stopPropagation()}>
+              <div className="sync-confirm-header">
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 600 }}>
+                  <Icon name="check" size={20} />
+                  <span>Confirmar Gravação da Sincronização</span>
+                </div>
+                {!busy && !confirmSuccess && (
+                  <button type="button" className="btn-icon" onClick={() => setConfirmModal(null)}>
+                    <Icon name="close" size={18} />
+                  </button>
+                )}
+              </div>
+
+              <div className="sync-confirm-body">
+                {confirmSuccess ? (
+                  <div style={{ textAlign: 'center', padding: '16px 8px' }}>
+                    <div style={{ color: '#34d399', marginBottom: 10 }}>
+                      <Icon name="check" size={48} />
+                    </div>
+                    <h3 style={{ margin: '0 0 6px', color: '#fff', fontSize: '1.2rem' }}>
+                      Sincronização Gravada com Sucesso!
+                    </h3>
+                    <p className="muted" style={{ margin: '0 0 16px', fontSize: '0.9rem' }}>
+                      {confirmSuccess.records} registros e {confirmSuccess.maps} plantas atualizados no sistema.
+                    </p>
+                    <p style={{ color: '#38bdf8', fontSize: '0.85rem', marginBottom: 16 }}>
+                      Atualizando e redirecionando para a planta da fábrica…
+                    </p>
+                    <button
+                      type="button"
+                      className="btn primary"
+                      onClick={() => { window.location.href = '/'; }}
+                      style={{ width: '100%', justifyContent: 'center', padding: '12px' }}
+                    >
+                      Ir para a Planta da Fábrica Agora
+                    </button>
+                  </div>
+                ) : (
+                  <>
+                    <div className="sync-manifest-card">
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                        <span style={{ fontSize: '0.82rem', color: '#94a3b8' }}>Conteúdo do Pacote:</span>
+                        <strong style={{ color: confirmModal.manifest?.type === 'full' ? '#38bdf8' : '#fbbf24', fontSize: '0.85rem' }}>
+                          {confirmModal.manifest?.type === 'full' ? 'Dados + Configurações (Completo)' : 'Somente Registros'}
+                        </strong>
+                      </div>
+
+                      <div className="sync-manifest-grid">
+                        <div className="sync-manifest-item">
+                          <dt>Registros de Bloqueio</dt>
+                          <dd>{formatInt(confirmModal.manifest?.counts?.records ?? 0)}</dd>
+                        </div>
+                        <div className="sync-manifest-item">
+                          <dt>Plantas / Mapas</dt>
+                          <dd>{confirmModal.manifest?.counts?.maps ?? 0}</dd>
+                        </div>
+                        <div className="sync-manifest-item">
+                          <dt>Áreas Delimitadas</dt>
+                          <dd>{confirmModal.manifest?.counts?.areas ?? 0}</dd>
+                        </div>
+                        <div className="sync-manifest-item">
+                          <dt>Imagens de Planta</dt>
+                          <dd>{confirmModal.manifest?.counts?.images ?? 0}</dd>
+                        </div>
+                      </div>
+                    </div>
+
+                    {confirmModal.manifest?.type === 'data' && (
+                      <div className="choice-list" style={{ marginTop: 2 }}>
+                        <label className={`choice ${receiveMode === 'replace' ? 'on' : ''}`}>
+                          <input
+                            type="radio"
+                            name="modalMode"
+                            checked={receiveMode === 'replace'}
+                            onChange={() => setReceiveMode('replace')}
+                          />
+                          <span>
+                            <strong>Substituir</strong>
+                            <small>Substitui os registros atuais pelos da sincronização.</small>
+                          </span>
+                        </label>
+                        <label className={`choice ${receiveMode === 'append' ? 'on' : ''}`}>
+                          <input
+                            type="radio"
+                            name="modalMode"
+                            checked={receiveMode === 'append'}
+                            onChange={() => setReceiveMode('append')}
+                          />
+                          <span>
+                            <strong>Acrescentar</strong>
+                            <small>Mantém os registros atuais e adiciona os novos sem duplicar.</small>
+                          </span>
+                        </label>
+                      </div>
+                    )}
+
+                    <div className="sync-password-box">
+                      <label style={{ fontSize: '0.85rem', fontWeight: 600 }}>
+                        Digite sua senha de administrador para autorizar a gravação:
+                      </label>
+                      <input
+                        type="password"
+                        value={adminPassword}
+                        onChange={(e) => setAdminPassword(e.target.value)}
+                        placeholder="Senha de administrador deste aparelho"
+                        autoFocus
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' && adminPassword && !busy) handleExecuteApply();
+                        }}
+                      />
+                      <small className="muted">
+                        Exigido para garantir que apenas administradores autorizados possam gravar os dados sincronizados.
+                      </small>
+                    </div>
+                  </>
+                )}
+              </div>
+
+              {!confirmSuccess && (
+                <div className="sync-confirm-footer">
+                  <button type="button" className="btn" onClick={() => setConfirmModal(null)} disabled={busy}>
+                    Cancelar
+                  </button>
+                  <button
+                    type="button"
+                    className="btn primary"
+                    onClick={handleExecuteApply}
+                    disabled={busy || !adminPassword}
+                  >
+                    {busy ? 'Gravando dados e imagens…' : 'Confirmar e Gravar Sincronização'}
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+        {/* Modal de Transmissão / Código de Sincronização */}
+        {syncExportModalOpen && syncExportData && (
+          <Modal title="Processo de Sincronização" onClose={() => setSyncExportModalOpen(false)}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+              <DynamicSyncCode
+                code={syncExportData.code}
+                onCopy={() => toast('Código de sincronização copiado!')}
+              />
+
+              <dl className="facts" style={{ marginTop: 4, marginBottom: 4 }}>
+                <div><dt>Tipo</dt><dd>{TYPE_NAME[syncExportData.manifest.type]}</dd></div>
+                <div><dt>Registros</dt><dd>{formatInt(syncExportData.manifest.counts.records)}</dd></div>
+                {syncExportData.manifest.type === 'full' && (
+                  <div><dt>Plantas / Áreas</dt><dd>{syncExportData.manifest.counts.maps} / {syncExportData.manifest.counts.areas}</dd></div>
+                )}
+                <div><dt>Tamanho comprimido</dt><dd>{formatBytes(syncExportData.compressedBytes)}</dd></div>
+                <div><dt>Gerado em</dt><dd>{formatDateTime(syncExportData.manifest.created_at)}</dd></div>
+              </dl>
+
+              <label className="field">
+                <span>Código para transferência manual direta (ideal entre notebooks):</span>
+                <textarea
+                  readOnly
+                  rows={3}
+                  value={syncExportData.code}
+                  className="sync-code-area"
+                  onClick={(e) => e.target.select()}
+                />
+              </label>
+
+              <div className="row" style={{ marginTop: 4, justifyContent: 'space-between' }}>
+                <button type="button" className={`btn ${copiedSync ? 'primary' : ''}`} onClick={handleCopySyncCode}>
+                  <Icon name={copiedSync ? 'check' : 'file'} size={16} />
+                  <span>{copiedSync ? 'Código copiado!' : 'Copiar código de sincronização'}</span>
+                </button>
+                <button type="button" className="btn ghost" onClick={() => setSyncExportModalOpen(false)}>
+                  Fechar
+                </button>
+              </div>
+            </div>
+          </Modal>
+        )}
+
+        {/* Modal de Confirmação com Palavra-Chave da Área de Risco */}
+        {dangerModal && (
+          <Modal
+            title={dangerModal.title}
+            onClose={() => !dangerBusy && setDangerModal(null)}
+            footer={
+              <>
+                <button type="button" className="btn" onClick={() => setDangerModal(null)} disabled={dangerBusy}>
+                  Cancelar
+                </button>
+                <button
+                  type="button"
+                  className="btn danger-solid"
+                  onClick={handleExecuteDanger}
+                  disabled={dangerBusy || typedKeyword.trim() !== dangerModal.keyword}
+                >
+                  {dangerBusy ? 'Executando…' : 'Confirmar e Excluir'}
+                </button>
+              </>
+            }
+          >
+            <div className="danger-modal-body">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: '#b91c1c' }}>
+                <Icon name="alert" size={24} />
+                <strong style={{ fontSize: 15 }}>Atenção: esta ação é irreversível!</strong>
+              </div>
+              <p style={{ margin: 0, fontSize: 14, color: 'var(--ink, #1f2937)', lineHeight: 1.5 }}>
+                {dangerModal.desc}
+              </p>
+              <div style={{ background: '#f8fafc', border: '1px solid var(--line, #e2e8f0)', borderRadius: 10, padding: 14 }}>
+                <p style={{ margin: '0 0 8px', fontSize: 13, color: 'var(--steel, #64748b)' }}>
+                  Para confirmar, digite exatamente a palavra-chave abaixo:
+                </p>
+                <div style={{ textAlign: 'center', margin: '6px 0 12px' }}>
+                  <span className="danger-keyword-badge">{dangerModal.keyword}</span>
+                </div>
+                <input
+                  type="text"
+                  className="field-input"
+                  style={{ width: '100%', boxSizing: 'border-box', textAlign: 'center', fontWeight: 'bold', letterSpacing: '0.05em', background: '#fff', border: '1px solid var(--line, #cbd5e1)', borderRadius: 8, padding: '10px 12px', fontSize: 15 }}
+                  placeholder={`Digite ${dangerModal.keyword}`}
+                  value={typedKeyword}
+                  onChange={(e) => setTypedKeyword(e.target.value)}
+                  autoFocus
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && typedKeyword.trim() === dangerModal.keyword && !dangerBusy) {
+                      handleExecuteDanger();
+                    }
+                  }}
+                />
+              </div>
+            </div>
+          </Modal>
+        )}
+      </div>
+    </Shell>
+  );
+}

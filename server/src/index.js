@@ -252,9 +252,14 @@ app.use((err, _req, res, _next) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n  Mapa da fábrica rodando em http://localhost:${PORT}`);
-  console.log(`  Painel admin:           http://localhost:${PORT}/admin`);
-  if (!fs.existsSync(CLIENT_DIST)) console.log('  (client/dist não encontrado: rode "npm run build" ou use "npm run dev")');
-  console.log();
+  console.log(`\n  ==============================================================`);
+  console.log(`                    EasyLOTOTO for Knauf v2`);
+  console.log(`         Gestão Visual de Bloqueios e Etiquetagens LOTOTO`);
+  console.log(`  ==============================================================`);
+  console.log(`  [✓] Servidor iniciado com sucesso!`);
+  console.log(`  -> Link de acesso: http://localhost:${PORT}`);
+  console.log(`  -> Para encerrar:  Pressione Ctrl + C nesta janela`);
+  if (!fs.existsSync(CLIENT_DIST)) console.log('\n  [AVISO] client/dist não encontrado. Execute: npm run build');
+  console.log(`  ==============================================================\n`);
   startJobs();
 });

@@ -21,16 +21,14 @@ setInterval(() => {
   }
 }, 60000).unref();
 
-const insertCache = new Map();
 function insertRows(table, list) {
   if (!Array.isArray(list) || !list.length) return;
   const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
   for (const r of list) {
     const ks = cols.filter((c) => c in r);
     if (!ks.length) continue;
-    const sql = `INSERT INTO ${table} (${ks.map((k) => `"${k}"`).join(',')}) VALUES (${ks.map(() => '?').join(',')})`;
-    if (!insertCache.has(sql)) insertCache.set(sql, db.prepare(sql));
-    insertCache.get(sql).run(ks.map((k) => r[k]));
+    const sql = `INSERT OR REPLACE INTO ${table} (${ks.map((k) => `"${k}"`).join(',')}) VALUES (${ks.map(() => '?').join(',')})`;
+    db.prepare(sql).run(ks.map((k) => r[k]));
   }
 }
 

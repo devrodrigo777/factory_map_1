@@ -20,7 +20,14 @@ const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).cat
 export const BACKUP_DIR = path.join(DATA_DIR, 'backups');
 fs.mkdirSync(BACKUP_DIR, { recursive: true });
 const NAME_RE = /^[\w.-]+\.zip$/;
-const SCHEMA = () => db.pragma('user_version', { simple: true });
+const SCHEMA = () => {
+  try {
+    const v = Number(db.pragma('user_version', { simple: true }));
+    return Number.isFinite(v) && v > 0 ? v : 1;
+  } catch {
+    return 1;
+  }
+};
 
 const FULL_TABLES = ['maps', 'areas', 'fields', 'imports', 'records', 'kpis', 'settings', 'import_profiles'];
 const DELETE_ORDER = ['records', 'imports', 'areas', 'maps', 'fields', 'kpis', 'settings', 'import_profiles'];
@@ -108,7 +115,9 @@ async function readBackup(buffer) {
   let manifest, data;
   try { manifest = JSON.parse(strFromU8(files['manifest.json'])); data = JSON.parse(strFromU8(files['data.json'])); } catch { throw httpError(400, 'Backup corrompido.'); }
   if (manifest.app !== 'factory-map' || !['data', 'full'].includes(manifest.type)) throw httpError(400, 'O arquivo não parece um backup deste sistema.');
-  if (manifest.schema > SCHEMA()) throw httpError(400, 'Este backup foi feito por uma versão mais nova do sistema. Atualize o sistema antes de restaurar.');
+  const currentSchema = Math.max(1, SCHEMA());
+  const backupSchema = Number(manifest.schema) || 1;
+  if (backupSchema > currentSchema) throw httpError(400, 'Este backup foi feito por uma versão mais nova do sistema. Atualize o sistema antes de restaurar.');
   return { files, manifest, data };
 }
 
@@ -120,15 +129,13 @@ function loadInput(req) {
 }
 
 // ---------- restauração ----------
-const insertCache = new Map();
 function insertRows(table, list) {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
   for (const r of list) {
     const ks = cols.filter((c) => c in r);
     if (!ks.length) continue;
-    const sql = `INSERT INTO ${table} (${ks.map((k) => `"${k}"`).join(',')}) VALUES (${ks.map(() => '?').join(',')})`;
-    if (!insertCache.has(sql)) insertCache.set(sql, db.prepare(sql));
-    insertCache.get(sql).run(ks.map((k) => r[k]));
+    const sql = `INSERT OR REPLACE INTO ${table} (${ks.map((k) => `"${k}"`).join(',')}) VALUES (${ks.map(() => '?').join(',')})`;
+    db.prepare(sql).run(ks.map((k) => r[k]));
   }
 }
 

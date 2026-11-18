@@ -36,6 +36,9 @@ export default function App() {
             <Route path="/backup" element={<Protected min="admin"><Backup /></Protected>} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
+          <div className="app-watermark" aria-hidden="true">
+            Desenvolvido e Implementado por Rodrigo Lopes • Estagiário de Engenharia de Software
+          </div>
           </AuthProvider>
         </ConfirmProvider>
       </ToastProvider>

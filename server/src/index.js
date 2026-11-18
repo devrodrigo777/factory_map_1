@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { db, UPLOAD_DIR } from './db.js';
+import { db, UPLOAD_DIR, getSetting, setSetting } from './db.js';
 import { router as loto } from './loto.js';
 import { validateExpr } from './core.js';
 import { guard, router as authRouter, uploadsGuard } from './auth.js';
@@ -89,7 +89,7 @@ const q = {
             @lock_filter, @show_lock, @display_fields)`),
 };
 
-const mapOut = (m) => ({ ...m, is_root: !!m.is_root });
+const mapOut = (m) => (m ? { ...m, is_root: !!m.is_root, image_effect: getSetting(`map_effect_${m.id}`) || 'none' } : null);
 const areaOut = (a) => ({
   ...a,
   points: JSON.parse(a.points),
@@ -165,6 +165,9 @@ app.patch('/api/maps/:id', (req, res) => {
       db.prepare('UPDATE maps SET is_root = 0').run();
       db.prepare('UPDATE maps SET is_root = 1 WHERE id = ?').run(id);
     }
+    if (typeof req.body.image_effect === 'string') {
+      setSetting(`map_effect_${id}`, req.body.image_effect.trim());
+    }
   })();
   res.json(withAreas(q.one.get(id)));
 });
@@ -186,6 +189,9 @@ app.delete('/api/maps/:id', (req, res) => {
   if (!map) throw httpError(404, 'Planta não encontrada.');
   db.transaction(() => {
     db.prepare('DELETE FROM maps WHERE id = ?').run(id);
+    try {
+      db.prepare("DELETE FROM settings WHERE key = ?").run(`map_effect_${id}`);
+    } catch {}
     if (map.is_root) {
       const next = db.prepare('SELECT id FROM maps ORDER BY id LIMIT 1').get();
       if (next) db.prepare('UPDATE maps SET is_root = 1 WHERE id = ?').run(next.id);
